@@ -2,8 +2,8 @@ import os
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-import torch
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+import torch  # No longer used for model training here—but still used for other parts of the pipeline if needed
 from tqdm import tqdm
 
 # Import custom modules and configuration
@@ -15,31 +15,14 @@ import modeling
 import evaluation
 import visualization
 
-def create_sequences(X, y, seq_len):
-    """
-    Create sequences using a sliding window.
-    
-    For each sequence of length `seq_len` from X, the corresponding target is the value at index (i + seq_len)
-    in y.
-    """
-    X_seq = []
-    y_seq = []
-    for i in range(len(X) - seq_len):
-        X_seq.append(X[i: i+seq_len])
-        y_seq.append(y[i+seq_len])
-    return np.array(X_seq), np.array(y_seq)
-
 def main():
-    print("Starting energy prediction pipeline with GRU model...")
+    print("Starting energy prediction pipeline with XGBoost gradient boosting...")
     
     # ---------------------------
-    # Hyperparameters
+    # Hyperparameters for training
     # ---------------------------
-    TRAIN_SPLIT_RATIO = 0.8      # 80% of sequences for training, remaining for validation
-    BATCH_SIZE = 64
-    EPOCHS = 100
-    LEARNING_RATE = 1e-3
-    SEQ_LEN = 50               # Sequence length for RNN input
+    TRAIN_SPLIT_RATIO = 0.8      # 80% for training, 20% for validation
+    XGB_NUM_ROUNDS = 100         # Number of boosting rounds for XGBoost
     
     # ---------------------------
     # Data Loading
@@ -67,72 +50,37 @@ def main():
     print("Dataset shape:", dataset.shape)
     
     # ---------------------------
-    # Prepare data for GRU (convert to sequences)
+    # Prepare data for gradient boosting (tabular format)
     # ---------------------------
     X = dataset.drop("target", axis=1).values
     y = dataset.target.values
     
-    # Create sequences with the specified sequence length
-    X_seq, y_seq = create_sequences(X, y, SEQ_LEN)
-    
-    # Split into training and validation sets based on sequences
-    split_index = int(len(X_seq) * TRAIN_SPLIT_RATIO)
-    X_train, X_val = X_seq[:split_index], X_seq[split_index:]
-    y_train, y_val = y_seq[:split_index], y_seq[split_index:]
-    print(f"Training sequences: {X_train.shape}, Validation sequences: {X_val.shape}")
-    
-    # Convert to PyTorch tensors
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
-    
-    # Create DataLoaders (each sample shape: (seq_len, feature_dim))
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # Split the dataset into training and validation sets
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=(1 - TRAIN_SPLIT_RATIO), random_state=42)
+    print(f"Training data: {X_train.shape}, Validation data: {X_val.shape}")
     
     # ---------------------------
-    # Model Creation and CUDA check
+    # Model Creation and Training with XGBoost
     # ---------------------------
-    input_dim = X_train.shape[2]  # number of features per timestep
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        print("CUDA device is available. Training on GPU.")
-    else:
-        print("CUDA device is not available. Training on CPU.")
-    
-    # Create GRU model
-    model = modeling.create_gru_model(input_dim)
-    model.to(device)
-    
-    # ---------------------------
-    # Train the model
-    # ---------------------------
-    print("Starting training...")
-    train_losses, val_losses = modeling.train_pytorch_model(model, 
-                                                            train_loader, 
-                                                            val_loader, 
-                                                            epochs=EPOCHS, 
-                                                            lr=LEARNING_RATE, 
-                                                            device=device)
+    print("Creating XGBoost model parameters...")
+    params = modeling.create_xgb_model()  # Using default parameters tuned for time series tasks
+    print("Training the XGBoost model...")
+    xgb_model = modeling.train_xgb_model(params, X_train, y_train, X_val, y_val, num_rounds=XGB_NUM_ROUNDS)
     
     # ---------------------------
     # Evaluate on validation set
     # ---------------------------
-    model.eval()
-    with torch.no_grad():
-        y_val_pred = model(X_val_tensor.to(device)).squeeze().cpu().numpy()
+    print("Evaluating the model...")
+    y_val_pred = modeling.predict_xgb_model(xgb_model, X_val)
     eval_scores = evaluation.evaluate_model(y_val, y_val_pred)
     print("Evaluation scores on validation data:", eval_scores)
     
     # ---------------------------
     # Visualization
     # ---------------------------
-    print("Plotting predictions and loss curves...")
-    visualization.plot_predictions(y_val, y_val_pred, sample_size=100)
-    visualization.plot_loss(train_losses, val_losses)
+    print("Plotting predictions...")
+    # Convert predictions and ground-truth values to Series for plotting
+    visualization.plot_predictions(pd.Series(y_val), pd.Series(y_val_pred), sample_size=100)
     
     print("Pipeline finished successfully.")
 
