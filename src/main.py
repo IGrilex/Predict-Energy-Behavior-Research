@@ -38,7 +38,7 @@ def main():
     # Hyperparameters for training
     # ---------------------------
     TRAIN_SPLIT_RATIO = 0.8      # 80% for training, 20% for validation
-    XGB_NUM_ROUNDS = 100         # Number of boosting rounds for XGBoost
+    XGB_NUM_ROUNDS = 1000         # Number of boosting rounds for XGBoost
     RANDOM_STATE = 42            # For reproducible train/test split
 
     # ---------------------------
