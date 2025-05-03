@@ -13,7 +13,7 @@ def create_xgb_model(params=None):
             "objective": "reg:squarederror",  # using squared error objective
             "eval_metric": "mae",             # track MAE during training
             "eta": 0.1,                       # Original learning rate
-            "max_depth": 70,                  # Original tree depth
+            "max_depth": 6,                   # Original tree depth
             "subsample": 0.8,                 # Original subsample
             "colsample_bytree": 0.8,          # Original colsample
             "seed": 42                        # Keep seed for reproducibility
