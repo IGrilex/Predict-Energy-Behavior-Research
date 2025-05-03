@@ -110,7 +110,7 @@ def process_weather_data(wd: pd.DataFrame, wss: pd.DataFrame, feature_names: lis
 # --- End Parallelized Weather Processing ---
 
 
-# --- REVERTED: Original Prosumer Processing (using apply) ---
+# --- MODIFIED: Added Time Feature Engineering ---
 def process_prosumer_data(prosumers: pd.DataFrame, clients: pd.DataFrame):
     """
     Process prosumer data: adds time features, merges with client data.
@@ -267,7 +267,83 @@ def process_gas_price_data(data: pd.DataFrame):
 # --- End REVERTED Gas Price Processing ---
 
 
-# --- MODIFIED: Accept cached weather function ---
+# --- NEW FUNCTION: Add Lag and Rolling Window Features ---
+def add_lag_rolling_features(df: pd.DataFrame,
+                             group_cols=['county', 'product_type', 'is_business', 'is_consumption'], # Columns defining unique time series
+                             target_col='target',
+                             lags=[1, 2, 3, 24, 48, 168], # e.g., 1h, 2h, 3h, 1day, 2day, 1week
+                             windows=[3, 6, 12, 24], # e.g., 3h, 6h, 12h, 24h rolling stats
+                             features_to_roll=['target', 'electricity_price', 'avg_gas_price'] # Add relevant features
+                             ):
+    """
+    Adds lag and rolling window features to the dataframe.
+    Assumes df is sorted by time within groups if group_cols are provided.
+    """
+    tqdm.write(f"Adding lag/rolling features for target '{target_col}' and features {features_to_roll}...")
+
+    # Ensure datetime column exists for sorting (should exist from process_prosumer_data)
+    if 'datetime' not in df.columns or not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+        tqdm.write("Error: 'datetime' column missing or not datetime type. Cannot reliably sort for lags/rolling.")
+        return df # Return original df
+
+    # Sort data globally first to ensure correct shifts/rolling if not grouping
+    # If grouping, sorting within group is handled by pandas groupby().shift/rolling()
+    # It's safer to sort explicitly here if the order isn't guaranteed earlier
+    df = df.sort_values(by=['datetime']) # Sort globally first
+    # If grouping is essential for correct sorting (e.g., multiple series interleaved)
+    # df = df.sort_values(by=group_cols + ['datetime']) # Sort by groups then time
+
+    # Create Lag Features for the target
+    if target_col in df.columns:
+        tqdm.write(f"  Creating lag features for '{target_col}' with lags: {lags}")
+        for lag in lags:
+            lag_col_name = f'{target_col}_lag_{lag}'
+            if group_cols:
+                # Calculate lags within each group to prevent leakage across series
+                df[lag_col_name] = df.groupby(group_cols, observed=False, group_keys=False)[target_col].shift(lag)
+            else:
+                # Calculate lags globally if no grouping
+                df[lag_col_name] = df[target_col].shift(lag)
+    else:
+        tqdm.write(f"Warning: Target column '{target_col}' not found for lag features.")
+
+    # Create Rolling Window Features
+    for feature in features_to_roll:
+        if feature in df.columns:
+            tqdm.write(f"  Creating rolling window features for '{feature}' with windows: {windows}")
+            for window in windows:
+                # Shift by 1 to ensure rolling window uses past data only (avoids data leakage)
+                shifted_feature = df.groupby(group_cols, observed=False, group_keys=False)[feature].shift(1) if group_cols else df[feature].shift(1)
+
+                # Calculate rolling mean and std dev
+                roll_mean_col = f'{feature}_roll_mean_{window}'
+                roll_std_col = f'{feature}_roll_std_{window}'
+
+                if group_cols:
+                    # Apply rolling within each group
+                    # Need to group by the same columns again for rolling
+                    # Using transform is often cleaner for assigning back
+                    df[roll_mean_col] = shifted_feature.groupby(df[group_cols].apply(tuple, axis=1), observed=False).rolling(window=window, min_periods=1).mean().reset_index(level=0, drop=True)
+                    df[roll_std_col] = shifted_feature.groupby(df[group_cols].apply(tuple, axis=1), observed=False).rolling(window=window, min_periods=1).std().reset_index(level=0, drop=True)
+                    # Alternative using transform (might be more robust)
+                    # df[roll_mean_col] = df.groupby(group_cols, observed=False, group_keys=False)[feature].shift(1).transform(lambda x: x.rolling(window=window, min_periods=1).mean())
+                    # df[roll_std_col] = df.groupby(group_cols, observed=False, group_keys=False)[feature].shift(1).transform(lambda x: x.rolling(window=window, min_periods=1).std())
+                else:
+                    df[roll_mean_col] = shifted_feature.rolling(window=window, min_periods=1).mean()
+                    df[roll_std_col] = shifted_feature.rolling(window=window, min_periods=1).std()
+
+            # Fill initial NaNs in std dev (first value has no std dev)
+            std_cols = [f'{feature}_roll_std_{w}' for w in windows if f'{feature}_roll_std_{w}' in df.columns]
+            df[std_cols] = df[std_cols].fillna(0) # Replace NaN std dev with 0
+        else:
+            tqdm.write(f"Warning: Column '{feature}' not found for rolling window features.")
+
+    tqdm.write("Finished adding lag/rolling features.")
+    return df
+# --- End NEW FUNCTION ---
+
+
+# --- MODIFIED: Ensure unique columns before returning from make_dataset ---
 def make_dataset(prosumer: pd.DataFrame,
                  weather_forecast_data: pd.DataFrame,
                  weather_stations: pd.DataFrame,
@@ -275,20 +351,17 @@ def make_dataset(prosumer: pd.DataFrame,
                  electricity_prices: pd.DataFrame,
                  gas_prices: pd.DataFrame,
                  weather_feature_names: list,
-                 # Add argument for the (potentially cached) weather function
-                 process_weather_func=process_weather_data
+                 process_weather_func=process_weather_data # Accept cached func
                  ):
     """
     Create a combined dataset for prediction by merging processed data.
     Uses specified weather processing function (potentially cached) and
     ORIGINAL apply operations, maintaining original merge logic and STRING keys.
-    Includes time features.
+    Includes time features. Lag/Rolling features added AFTER this function in main.py.
     """
     tqdm.write("Starting dataset creation (Parallel Weather, Original Apply Ops, Time Features)...")
     # Process individual data sources
-    # --- Use the passed weather processing function ---
-    weather_data = process_weather_func(weather_forecast_data, weather_stations, weather_feature_names)
-    # --- End Use Passed Function ---
+    weather_data = process_weather_func(weather_forecast_data, weather_stations, weather_feature_names) # Parallel Weather, index is (county, forecast_datetime_str)
     prosumer_data = process_prosumer_data(prosumer, client) # Original apply, returns 'date' (string) + time features
     electricity_data = process_elec_price_data(electricity_prices) # Returns 'forecast_date' as string YYYY-MM-DD HH:MM:SS
     gas_data = process_gas_price_data(gas_prices) # Original apply, returns 'forecast_date' as string YYYY-MM-DD
@@ -307,16 +380,15 @@ def make_dataset(prosumer: pd.DataFrame,
     tqdm.write("Merging prosumer and weather data...")
     # Create the string datetime key from prosumer's datetime column
     if 'datetime' in prosumer_data.columns:
-        # Ensure datetime is string format for key
         if pd.api.types.is_datetime64_any_dtype(prosumer_data['datetime']):
              prosumer_data['datetime_str_key'] = prosumer_data['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
         elif pd.api.types.is_string_dtype(prosumer_data['datetime']):
-             prosumer_data['datetime_str_key'] = prosumer_data['datetime'] # Assume already correct string
-        else: # Attempt conversion if other type
+             prosumer_data['datetime_str_key'] = prosumer_data['datetime']
+        else:
              tqdm.write(f"Converting prosumer datetime from {prosumer_data['datetime'].dtype} to string key")
              prosumer_data['datetime_str_key'] = pd.to_datetime(prosumer_data['datetime'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        prosumer_data = prosumer_data.dropna(subset=['datetime_str_key']) # Drop if conversion/formatting failed
+        prosumer_data = prosumer_data.dropna(subset=['datetime_str_key'])
         left_dt_key = 'datetime_str_key'
         if prosumer_data.empty:
             tqdm.write("Warning: Prosumer data empty after creating/validating string datetime key.")
@@ -387,35 +459,43 @@ def make_dataset(prosumer: pd.DataFrame,
     tqdm.write(f"Shape after merging gas prices: {data.shape}")
 
 
-    # --- Final Feature Selection (INCLUDE Time Features) ---
+    # --- Final Feature Selection (Ensure Unique Columns) ---
     # Define the base feature columns
     base_feats = ["is_consumption", "eic_count", "installed_capacity", "electricity_price", "avg_gas_price"] \
             + weather_feature_names
 
-    # Define the new time features
+    # Define the time features added in process_prosumer_data
     time_feats = ['hour', 'dayofweek', 'dayofmonth', 'dayofyear', 'month', 'year', 'weekofyear', 'quarter']
 
-    # Combine all features + target
-    feats = base_feats + time_feats + ["target"]
+    # Define grouping columns needed for lag/roll function (and potentially as features)
+    group_cols_for_lag = ['county', 'product_type', 'is_business', 'is_consumption']
 
-    # Select available features from the combined list
-    available_feats = [f for f in feats if f in data.columns]
-    missing = set(feats) - set(available_feats)
+    # Combine all columns to keep initially
+    keep_cols_initial = base_feats + time_feats + ["target", "datetime"] + group_cols_for_lag
+
+    # --- FIX: Ensure unique columns ---
+    # Get columns that actually exist in the dataframe 'data' from the initial list
+    present_cols = [col for col in keep_cols_initial if col in data.columns]
+    # Get unique columns while preserving order (important for consistency)
+    unique_cols = list(pd.Index(present_cols).unique())
+    # --- End FIX ---
+
+    # Select the unique present columns
+    data_final = data[unique_cols].copy()
+
+    # Report any initially requested columns that were missing
+    missing = set(keep_cols_initial) - set(data.columns)
     if missing:
-        tqdm.write(f"Warning: Missing expected columns before final selection: {missing}. Selecting available ones.")
+        tqdm.write(f"Warning: Missing expected columns after merges: {missing}.")
 
-    # Check target existence carefully
-    if "target" not in data.columns:
-         tqdm.write("Error: 'target' column missing before final selection.")
+    # Check target existence again after selection
+    if "target" not in data_final.columns:
+         tqdm.write("Error: 'target' column missing after final selection.")
          return pd.DataFrame()
-    elif "target" not in available_feats:
-         available_feats.append("target") # Ensure target is in the list if it exists
 
-    if data.empty:
-        tqdm.write("Warning: Dataframe is empty before final feature selection.")
-        return pd.DataFrame(columns=available_feats)
-
-    data_final = data[available_feats].copy()
+    if data_final.empty:
+        tqdm.write("Warning: Dataframe is empty after final feature selection.")
+        return pd.DataFrame(columns=unique_cols)
 
     # --- NO FINAL DROPNA in original code ---
     tqdm.write("Skipping final dropna step (original logic).")
@@ -427,8 +507,7 @@ def make_dataset(prosumer: pd.DataFrame,
     if 'datetime_str_key' in data_final.columns:
         data_final = data_final.drop(columns=['datetime_str_key'])
 
-    # Drop original datetime and date columns if no longer needed (optional)
-    # data_final = data_final.drop(columns=['datetime', 'date'], errors='ignore')
-
+    # Return dataframe including 'datetime' and group columns needed for next step
     return data_final
 # --- End MODIFIED make_dataset ---
+
